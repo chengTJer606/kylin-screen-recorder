@@ -10,6 +10,7 @@
 """
 import glob
 import json
+import logging
 import os
 import queue
 import re
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # ---------------- 路径与常量 ----------------
@@ -44,6 +46,37 @@ QUALITY = {          # 显示名 -> crf
 DISK_GUARD_BYTES = 1 * 1024 ** 3   # 磁盘剩余低于 1GB 触发守护
 DISK_CHECK_INTERVAL = 30           # 录制中每 30 秒检查一次
 BAD_CHARS = '/\\:*?"<>|'
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_KEEP_REC = 20                  # 每次录制的 ffmpeg 日志保留最近 20 次
+
+log = logging.getLogger("recorder")
+
+
+def setup_logging():
+    """初始化 logs/ 日志：app.log 滚动保存（5MB×3）"""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log.setLevel(logging.INFO)
+    h = RotatingFileHandler(os.path.join(LOG_DIR, "app.log"),
+                            maxBytes=5 * 1024 ** 2, backupCount=3,
+                            encoding="utf-8")
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(h)
+
+
+def log_session_boot():
+    """会话启动快照：版本与默认音频设备（排查问题的第一手上下文）"""
+    log.info("=" * 60)
+    log.info("会话启动")
+    try:
+        v = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True,
+                           timeout=5).stdout.splitlines()
+        if v:
+            log.info("ffmpeg: %s", v[0])
+    except Exception:
+        log.warning("无法获取 ffmpeg 版本")
+    log.info("默认输出: %s", pactl_field(["默认音频入口", "Default Sink"]) or "未知")
+    log.info("默认输入: %s", pactl_field(["默认信源", "Default Source"]) or "未知")
 
 
 # ---------------- 工具函数 ----------------
@@ -110,6 +143,39 @@ def default_mic():
     return pactl_field(["默认信源", "Default Source"])
 
 
+def enum_input_sources():
+    """枚举全部真实输入源（排除 monitor 监听源），返回 [(名称, 描述)]。
+    兼容 pactl 中英文输出（名称/Name、描述/Description）"""
+    try:
+        out = subprocess.run(["pactl", "list", "sources"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=8).stdout
+    except Exception:
+        return []
+    sources, name, desc = [], "", ""
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("名称：") or s.startswith("Name:"):
+            name = re.split(r"：|:", s, maxsplit=1)[1].strip()
+        elif s.startswith("描述：") or s.startswith("Description:"):
+            desc = re.split(r"：|:", s, maxsplit=1)[1].strip()
+            if name and not name.endswith(".monitor"):
+                sources.append((name, desc or name))
+            name, desc = "", ""
+    return sources
+
+
+def source_exists(name):
+    """探测输入源当前是否存在（蓝牙未连接时其 source 不在列表中）"""
+    try:
+        out = subprocess.run(["pactl", "list", "sources", "short"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=6).stdout
+        return any(len(cols) > 1 and cols[1] == name
+                   for cols in (ln.split("\t") for ln in out.splitlines()))
+    except Exception:
+        return False
+
+
 def ensure_analog_headset():
     """自愈：若默认输出是USB耳机却被系统错配为IEC958数字输出
     （此状态下声音流不通，任何录屏软件都录不到），自动切回模拟立体声。
@@ -164,9 +230,17 @@ class Engine:
         self.done_seconds = 0.0
         self.last_error = ""
         self.warning = ""          # 非致命提示（音频自愈/静音自检）
+        self.time_offset = 0.0     # 首段倒计时偏移（界面计时从倒计时结束清零起算）
 
-    def _launch_segment(self, audio_mode, crf, region=None):
+    def _warn(self, msg):
+        """非致命提示追加（多处告警不互相覆盖）"""
+        self.warning = (self.warning + "；" + msg) if self.warning else msg
+        log.warning(msg)
+
+    def _launch_segment(self, audio_mode, crf, region=None, mic_device=None):
         self.seg_index += 1
+        log.info("启动第 %d 段: 声音=%s crf=%s 区域=%s 指定麦克风=%s",
+                 self.seg_index, audio_mode, crf, region, mic_device or "跟随默认")
         os.makedirs(SEG_DIR, exist_ok=True)
         v_file = os.path.join(SEG_DIR, "seg_{:03d}_v.mp4".format(self.seg_index))
         a_file = os.path.join(SEG_DIR, "seg_{:03d}_a.m4a".format(self.seg_index))
@@ -208,8 +282,18 @@ class Engine:
             # 自愈：USB耳机被错配为IEC958数字输出时自动切回模拟（否则必录不到）
             notice = ensure_analog_headset()
             if notice:
-                self.warning = notice
-            mon, mic = default_monitor(), default_mic()
+                self._warn(notice)
+            mon = default_monitor()
+            mic = default_mic()
+            if mic_device:
+                # 用户指定了麦克风：先探测存在（蓝牙未连接时不在源列表中）
+                if source_exists(mic_device):
+                    mic = mic_device
+                    if "bluez" in mic_device.lower():
+                        self._warn("本次使用蓝牙麦克风，录音为电话音质（HFP 协议限制）")
+                else:
+                    self._warn("所选麦克风当前不存在（蓝牙未连接？），已回落到系统默认输入")
+            log.info("音频源: monitor=%s mic=%s", mon, mic)
             if audio_mode == "system" and mon:
                 args = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
                         "-f", "pulse", "-i", mon, "-c:a", "aac", "-b:a", "128k", a_file]
@@ -253,6 +337,9 @@ class Engine:
         self.cur["v_t0"] = v_t0          # 视频有效起点（首帧时刻）
         self.cur["a_t0"] = a_t0          # 音频有效起点（首字节时刻）
         self.seg_start_mono = v_t0
+        log.info("第 %d 段就绪: v_pid=%s 音频超前量=%.2fs",
+                 self.seg_index, v_pid,
+                 (v_t0 - a_t0) if (a_t0 and v_t0) else -1)
         return True
 
     def _finish_segment(self):
@@ -291,31 +378,66 @@ class Engine:
         if os.path.exists(seg["v"]) and os.path.getsize(seg["v"]) > 0:
             self.segments.append(seg)
             self.done_seconds += dur
+            log.info("第 %d 段完成: 时长 %.1fs", self.seg_index, dur)
+        else:
+            log.error("第 %d 段视频为空，已丢弃", self.seg_index)
         self.cur = None
         self.seg_start_mono = None
 
-    def start(self, audio_mode, crf, region=None):
+    def start(self, audio_mode, crf, region=None, mic_device=None):
         if self.cur:
             return False
-        return self._launch_segment(audio_mode, crf, region)
+        return self._launch_segment(audio_mode, crf, region, mic_device)
 
     def pause(self):
+        log.info("暂停（结束当前段）")
         self._finish_segment()
 
-    def resume(self, audio_mode, crf, region=None):
-        return self._launch_segment(audio_mode, crf, region)
+    def resume(self, audio_mode, crf, region=None, mic_device=None):
+        log.info("继续（新起一段）")
+        return self._launch_segment(audio_mode, crf, region, mic_device)
 
     def elapsed(self):
+        """界面显示计时：扣除首段倒计时偏移，从倒计时结束清零起算"""
         t = self.done_seconds
         if self.seg_start_mono is not None:
             t += time.monotonic() - self.seg_start_mono
-        return t
+        return max(0.0, t - self.time_offset)
+
+    def _archive_logs(self, tag):
+        """把本次各段的 ffmpeg 日志归并保存到 logs/（免截图排查），
+        仅保留最近 LOG_KEEP_REC 次录制的归档"""
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            for kind in ("v", "a"):
+                parts = sorted(glob.glob(os.path.join(
+                    SEG_DIR, "seg_*_%s.log" % kind)))
+                if not parts:
+                    continue
+                dst = os.path.join(LOG_DIR, "rec_%s_%s.log" % (tag, kind))
+                with open(dst, "w", encoding="utf-8") as out:
+                    for p in parts:
+                        out.write("===== %s =====\n" % os.path.basename(p))
+                        try:
+                            with open(p, encoding="utf-8", errors="replace") as f:
+                                out.write(f.read())
+                        except Exception:
+                            pass
+                        out.write("\n")
+            olds = sorted(glob.glob(os.path.join(LOG_DIR, "rec_*_?.log")),
+                          key=os.path.getmtime)[:-LOG_KEEP_REC * 2]
+            for p in olds:
+                os.remove(p)
+        except Exception:
+            log.exception("ffmpeg 日志归档失败")
 
     def merge(self, out_file):
         """合并所有段 → out_file；返回输出路径或 None"""
+        log.info("开始合成: %s", out_file)
         self._finish_segment()
         if not self.segments:
             self.last_error = "没有可合成的录像段"
+            log.error(self.last_error)
             return None
         segs, self.segments = self.segments, []
         self.done_seconds = 0.0
@@ -381,6 +503,8 @@ class Engine:
             cmd = ["ffmpeg", "-v", "error", "-y", "-i", v_all,
                    "-c", "copy", "-movflags", "+faststart", out_file]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        # 归档本次 ffmpeg 日志到 logs/ 后再清理分段（排查问题不再依赖截图）
+        self._archive_logs(os.path.splitext(os.path.basename(out_file))[0])
         for f in glob.glob(os.path.join(SEG_DIR, "seg_*")) + \
                  glob.glob(os.path.join(SEG_DIR, "merged_*")) + \
                  glob.glob(os.path.join(SEG_DIR, "acut_*")) + \
@@ -390,6 +514,8 @@ class Engine:
             except Exception:
                 pass
         if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+            log.info("合成成功: %s（%.1f MB）", out_file,
+                     os.path.getsize(out_file) / 1024 / 1024)
             # 静音自检：选了声音但全程近静音（<-60dB）时给出醒目提示
             if has_audio:
                 try:
@@ -399,14 +525,17 @@ class Engine:
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                         text=True, timeout=60).stderr
                     m = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", vd)
-                    if m and float(m.group(1)) < -60:
-                        self.warning = ("警告：本次录到的声音几乎全程静音。"
-                                        "若选择了电脑声音/麦克风，请检查系统音量、"
-                                        "默认输出设备及声卡配置")
+                    if m:
+                        log.info("静音自检 mean_volume: %s dB", m.group(1))
+                        if float(m.group(1)) < -60:
+                            self._warn("本次录到的声音几乎全程静音。"
+                                       "若选择了电脑声音/麦克风，请检查系统音量、"
+                                       "默认输出设备及声卡配置")
                 except Exception:
-                    pass
+                    log.exception("静音自检执行失败")
             return out_file
         self.last_error = "合成输出失败"
+        log.error("合成输出失败: %s", out_file)
         return None
 
 
@@ -696,6 +825,20 @@ class RecorderApp(tk.Tk):
         self.btn_stop.pack(side=tk.LEFT, padx=2)
         self.btn_close.pack(side=tk.LEFT, padx=(8, 0))
 
+        # 麦克风设备行（B 方案：枚举真实输入源供选择，蓝牙设备标注）
+        row_mic = tk.Frame(self, bg=self.BG, padx=10)
+        row_mic.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(row_mic, text="麦克风:", fg=self.GRAY, bg=self.BG,
+                 font=("Noto Sans CJK SC", 9)).pack(side=tk.LEFT)
+        self.mic_map = {}            # 显示名 -> 真实 source 名
+        self.mic_var = tk.StringVar(value="跟随系统默认")
+        self.mic_box = ttk.Combobox(row_mic, textvariable=self.mic_var,
+                                    width=26, state="readonly",
+                                    font=("Noto Sans CJK SC", 9))
+        self.mic_box.pack(side=tk.LEFT, padx=(2, 0))
+        self.mic_box.bind("<<ComboboxSelected>>", self.on_mic_change)
+        self.refresh_mic_devices()
+
         row2 = tk.Frame(self, bg=self.BG, padx=10)
         row2.pack(fill=tk.X)
         tk.Label(row2, text="输出:", fg=self.GRAY, bg=self.BG,
@@ -717,6 +860,27 @@ class RecorderApp(tk.Tk):
     def _short_dir(self, maxlen=38):
         d = self.output_dir
         return d if len(d) <= maxlen else "…" + d[-maxlen:]
+
+    # ---- 麦克风设备选择（B 方案） ----
+    def refresh_mic_devices(self):
+        """枚举真实输入源刷新下拉；蓝牙设备标注。回到 idle 时也会调用"""
+        self.mic_map = {"跟随系统默认": None}
+        for name, desc in enum_input_sources():
+            label = ("蓝牙｜" if "bluez" in name.lower() else "") + desc
+            self.mic_map[label] = name
+        self.mic_box.config(values=list(self.mic_map.keys()))
+        if self.mic_var.get() not in self.mic_map:
+            self.mic_var.set("跟随系统默认")
+        log.info("麦克风设备列表已刷新: %s", list(self.mic_map.keys()))
+
+    def on_mic_change(self, _e=None):
+        name = self.mic_map.get(self.mic_var.get())
+        if name and "bluez" in name.lower():
+            self.status_lbl.config(
+                text="提示：蓝牙耳机录音为电话音质（HFP 协议限制），追求音质请选板载麦克风")
+
+    def _selected_mic(self):
+        return self.mic_map.get(self.mic_var.get())
 
     def _mk_btn(self, parent, text, cmd, color, width=7):
         return tk.Button(parent, text=text, command=cmd, width=width,
@@ -743,6 +907,7 @@ class RecorderApp(tk.Tk):
         self.mode_box.config(state=ro)
         self.quality_box.config(state=ro)
         self.scope_box.config(state=ro)
+        self.mic_box.config(state=ro)
         self.btn_dir.config(state=tk.NORMAL if st == "idle" else tk.DISABLED)
         self.btn_close.config(state=tk.NORMAL if st not in ("merging", "countdown", "starting") else tk.DISABLED)
 
@@ -827,6 +992,9 @@ class RecorderApp(tk.Tk):
             return
         self._hide_done_panel()     # 收起上次的收尾面板
         self.engine = Engine(pw)
+        log.info("开始录制请求: 声音=%s 画质=%s 范围=%s 麦克风=%s 输出目录=%s 磁盘剩余=%.1fGB",
+                 self._mode_key(), self.quality_var.get(), self.scope_var.get(),
+                 self.mic_var.get(), self.output_dir, free / 1024 ** 3)
         cfg = load_config()
         cfg["quality"] = self.quality_var.get()
         save_config(cfg)
@@ -838,8 +1006,13 @@ class RecorderApp(tk.Tk):
         self.status_lbl.config(text="准备中…")
         self._refresh_buttons()
         threading.Thread(target=self._start_worker,
-                         args=(self._mode_key(), self._crf(), self.cur_region),
+                         args=(self._mode_key(), self._crf(), self.cur_region,
+                               self._selected_mic()),
                          daemon=True).start()
+
+    def _start_worker(self, mode, crf, region, mic_device=None):
+        ok = self.engine.start(mode, crf, region, mic_device)
+        self.worker_queue.put(("started", ok))
 
     def _do_countdown(self):
         if self._countdown_left > 0:
@@ -852,13 +1025,16 @@ class RecorderApp(tk.Tk):
             self.time_lbl.config(text="00:00:00", fg=self.FG)
             self._enter_recording()
 
-    def _start_worker(self, mode, crf, region):
-        ok = self.engine.start(mode, crf, region)
-        self.worker_queue.put(("started", ok))
-
     def _enter_recording(self):
         """进入录制态（F1：倒计时结束且进程已就绪时调用）"""
+        # 议题三A：界面计时从倒计时结束清零起算——记录首段倒计时偏移（仅首次）
+        if self.engine and self.engine.time_offset == 0.0 \
+                and self.engine.seg_start_mono is not None:
+            self.engine.time_offset = time.monotonic() - self.engine.seg_start_mono
+            log.info("计时偏移已设定: %.2fs（倒计时阶段不计入界面计时）",
+                     self.engine.time_offset)
         self.state = "recording"
+        log.info("进入录制态")
         self._last_disk_check = time.monotonic()
         self.status_lbl.config(text="录制中（窗口保持显示，可手动最小化；工具条会被录入请注意）")
         notify("录屏已开始", "正在录制，点「停止」结束")
@@ -882,11 +1058,13 @@ class RecorderApp(tk.Tk):
         self.worker_queue.put(("paused", True))
 
     def _resume_worker(self):
-        ok = self.engine.resume(self._mode_key(), self._crf(), self.cur_region)
+        ok = self.engine.resume(self._mode_key(), self._crf(), self.cur_region,
+                                self._selected_mic())
         self.worker_queue.put(("resumed", ok))
 
     # ---- 停止 ----
     def on_stop(self, auto=False):
+        log.info("停止录制%s", "（磁盘守护自动触发）" if auto else "（手动）")
         self.state = "merging"
         self._refresh_buttons()
         self.status_lbl.config(text="正在合成视频，请稍候…")
@@ -914,6 +1092,10 @@ class RecorderApp(tk.Tk):
             self.time_lbl.config(text=fmt_time(self.engine.elapsed()))
             self._blink_on = not self._blink_on
             self.dot.config(fg=self.RED if self._blink_on else "#7f1d1d")
+        elif self.state in ("countdown", "starting"):
+            # 议题三D：预热阶段黄点闪烁（ffmpeg 已就绪，画面已在录制）
+            self._blink_on = not self._blink_on
+            self.dot.config(fg=self.YELLOW if self._blink_on else "#7f6a1d")
             # 磁盘守护
             now = time.monotonic()
             if now - self._last_disk_check > DISK_CHECK_INTERVAL:
@@ -940,6 +1122,7 @@ class RecorderApp(tk.Tk):
                 self._do_countdown()
             else:
                 self.state = "idle"
+                log.error("启动失败: %s", self.engine.last_error or "未知")
                 self.status_lbl.config(text="启动失败: " + (self.engine.last_error or "未知"))
                 messagebox.showerror("启动失败", self.engine.last_error or "未知错误", parent=self)
         elif tag == "paused":
@@ -956,6 +1139,7 @@ class RecorderApp(tk.Tk):
             self.state = "idle"
             self.time_lbl.config(text="00:00:00")
             self.dot.config(fg=self.GRAY)
+            self.refresh_mic_devices()      # 蓝牙等设备可能插拔，回到 idle 刷新列表
             self.deiconify()            # 若用户手动最小化了，唤回展示收尾面板
             self.lift()
             if val:
@@ -969,6 +1153,7 @@ class RecorderApp(tk.Tk):
                     self.done_hint.config(text=self.engine.warning)
                     self.engine.warning = ""
             else:
+                log.error("合成失败: %s", self.engine.last_error or "未知")
                 self.status_lbl.config(text="合成失败: " + (self.engine.last_error or ""))
                 messagebox.showerror("合成失败", self.engine.last_error or "未知错误", parent=self)
         self._refresh_buttons()
@@ -1102,5 +1287,12 @@ class RecorderApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = RecorderApp()
-    app.mainloop()
+    setup_logging()
+    log_session_boot()
+    try:
+        app = RecorderApp()
+        app.mainloop()
+    except Exception:
+        log.exception("主界面异常退出")
+        raise
+    log.info("会话结束")
